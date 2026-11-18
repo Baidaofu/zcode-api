@@ -1,0 +1,100 @@
+name: Android unsigned APK
+
+# Fork-only helper (not part of upstream's release pipeline).
+#
+# The upstream `Release` workflow only packages the APK when the
+# ANDROID_KEYSTORE_* secrets exist; without them `build-android` just compiles.
+# This workflow builds the same release APK with Gradle's built-in fallback
+# (no `androidSigning.keystoreFile` → `app-release-unsigned.apk`) and attaches
+# it to an EXISTING release tag.
+#
+# Install note: an unsigned APK cannot upgrade an already-installed signed
+# build — it needs `adb install` after uninstalling, which drops the app's
+# login + config.yaml, or a local `apksigner` pass with your own key.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach the APK to (e.g. v4.9.1)"
+        required: true
+        type: string
+      ref:
+        description: "Branch or SHA to build from"
+        required: true
+        default: "master"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # PINNED — same runtime as ci.yml / release.yml.
+          bun-version: "1.4.0"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install JS dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build server bundle (esbuild CJS)
+        run: bun run build:android-bundle
+
+      - name: Copy server bundle into Android assets
+        run: cp dist/android/server.cjs Android-APP/app/src/main/assets/server_bundle/server.cjs
+
+      # Same derivation as release.yml's detect job, so the APK reports the
+      # tag version and UpdateChecker does not nag on every launch.
+      - name: Derive versionCode / versionName from the tag
+        id: v
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          VERSION="${TAG#v}"
+          CODE=$(printf '%s' "$VERSION" | awk -F. '{ gsub(/[^0-9].*/, "", $3); print ($1 * 10000) + ($2 * 100) + $3 }')
+          echo "code=${CODE}" >> "$GITHUB_OUTPUT"
+          echo "versionCode=${CODE} versionName=${TAG}"
+
+      - name: Make gradlew executable
+        working-directory: Android-APP
+        run: chmod +x gradlew
+
+      # No signing props → build.gradle.kts leaves buildTypes.release.signingConfig
+      # unset and Gradle emits app-release-unsigned.apk.
+      - name: Build release APK (unsigned)
+        working-directory: Android-APP
+        env:
+          ORG_GRADLE_PROJECT_androidApp_versionCode: ${{ steps.v.outputs.code }}
+          ORG_GRADLE_PROJECT_androidApp_versionName: ${{ inputs.tag }}
+        run: ./gradlew :app:assembleRelease --no-daemon
+
+      - name: Collect APK
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          OUT=$(find Android-APP/app/build/outputs/apk/release -name "*.apk" -type f | sort | head -1)
+          test -n "$OUT"
+          echo "built: $OUT"
+          cp "$OUT" "zcode-proxy-${TAG}-unsigned.apk"
+          ls -l "zcode-proxy-${TAG}-unsigned.apk"
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: gh release upload "$TAG" "zcode-proxy-${TAG}-unsigned.apk" --clobber
